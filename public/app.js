@@ -5,10 +5,12 @@ import * as pdfjsLib from "./vendor/pdfjs/pdf.min.mjs";
 pdfjsLib.GlobalWorkerOptions.workerSrc = "./vendor/pdfjs/pdf.worker.min.mjs";
 
 const $ = (sel) => document.querySelector(sel);
-const ZOOMS = [1, 1.25, 1.5, 2, 2.5, 3];
+const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 4;
 const LS = {
   open: "mpw:open",               // id do livro aberto (para reabrir direto nele)
-  pos: (id) => `mpw:pos:${id}`,   // cópia de segurança da página: {page, t}
+  pos: (id) => `mpw:pos:${id}`,   // cópia de segurança da posição: {page, anchor, t}
   night: "mpw:night",
   hint: "mpw:hint-dismissed",
 };
@@ -49,7 +51,6 @@ const db = (() => {
   return {
     allBooks: () => tx(["books"], "readonly", (t) => req2p(t.objectStore("books").getAll())),
     getBook: (id) => tx(["books"], "readonly", (t) => req2p(t.objectStore("books").get(id))),
-    putBook: (book) => tx(["books"], "readwrite", (t) => { t.objectStore("books").put(book); }),
     getFile: (id) => tx(["files"], "readonly", (t) => req2p(t.objectStore("files").get(id))),
     addBook: (book, data) =>
       tx(["books", "files"], "readwrite", (t) => {
@@ -76,15 +77,25 @@ function lsGet(k) { try { return localStorage.getItem(k); } catch { return null;
 function lsSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
 function lsDel(k) { try { localStorage.removeItem(k); } catch {} }
 
-/** Página salva: usa a mais recente entre IndexedDB e a cópia no localStorage. */
-function resolvePage(book) {
+/** Posição salva: usa a mais recente entre IndexedDB e a cópia no localStorage. */
+function resolvePos(book) {
   let page = book.page || 1;
+  let anchor = book.anchor || null;
   let t = book.pageSavedAt || 0;
   try {
     const backup = JSON.parse(lsGet(LS.pos(book.id)) || "null");
-    if (backup && backup.t > t) page = backup.page;
+    if (backup && backup.t > t) { page = backup.page; anchor = backup.anchor || null; }
   } catch {}
-  return Math.min(Math.max(1, page), book.pageCount || page);
+  const max = book.pageCount || page;
+  page = clamp(page, 1, max);
+  if (anchor) anchor.page = clamp(anchor.page, 1, max);
+  return { page, anchor };
+}
+
+async function savePosition(id, page, anchor) {
+  const t = Date.now();
+  lsSet(LS.pos(id), JSON.stringify({ page, anchor, t })); // síncrono: garante mesmo se o iOS matar o app
+  try { await db.updateBook(id, { page, anchor, pageSavedAt: t }); } catch (e) { console.warn(e); }
 }
 
 /* ===================================================================
@@ -144,7 +155,7 @@ async function renderLibrary() {
   $("#empty").hidden = books.length > 0;
 
   for (const book of books) {
-    const page = resolvePage(book);
+    const { page } = resolvePos(book);
     const pct = book.pageCount ? Math.round((page / book.pageCount) * 100) : 0;
     const el = document.createElement("div");
     el.className = "book";
@@ -218,6 +229,7 @@ async function addFiles(files) {
         size: file.size,
         pageCount: doc.numPages,
         page: 1,
+        anchor: null,
         pageSavedAt: Date.now(),
         zoom: 1,
         addedAt: Date.now(),
@@ -245,8 +257,7 @@ async function addFiles(files) {
 async function makeCover(doc) {
   const page = await doc.getPage(1);
   const vp1 = page.getViewport({ scale: 1 });
-  const scale = 300 / vp1.width;
-  const vp = page.getViewport({ scale });
+  const vp = page.getViewport({ scale: 300 / vp1.width });
   const c = document.createElement("canvas");
   c.width = Math.round(vp.width);
   c.height = Math.round(vp.height);
@@ -279,7 +290,7 @@ $("#book-menu").addEventListener("close", async () => {
     if (name && name.trim()) { await db.updateBook(book.id, { title: name.trim() }); renderLibrary(); }
   }
   if (action === "reset") {
-    await savePosition(book.id, 1);
+    await savePosition(book.id, 1, null);
     renderLibrary();
     toast("Marcador voltou para a página 1.");
   }
@@ -309,21 +320,99 @@ document.addEventListener("drop", (e) => {
 });
 
 /* ===================================================================
-   Leitor
+   Leitor — rolagem contínua (todas as páginas em sequência vertical),
+   desenho sob demanda (só as páginas perto da tela) e zoom com dois dedos.
 =================================================================== */
+const stage = $("#stage");
+const pagesEl = $("#pages");
+const PAD = 6;   // margem lateral (px, em zoom 1)
+const GAP = 10;  // espaço entre páginas (px, em zoom 1)
+const MAX_PIXELS = 8_000_000; // limite de pixels por página desenhada (memória do iPhone)
+
 const R = {
   book: null,
   doc: null,
-  page: 1,
+  page: 1,         // página exibida (a que ocupa o meio superior da tela)
   zoom: 1,
-  renderTask: null,
-  renderSeq: 0,
+  aspects: [],     // altura/largura de cada página
+  tops: [],
+  heights: [],
+  els: [],
+  pageW: 0,
+  near: new Set(), // páginas perto da área visível (devem estar desenhadas)
+  observer: null,
+  pumping: null,   // documento cuja fila de desenho está rodando
+  pinch: null,
+  lastPinchEnd: 0,
 };
 
-async function savePosition(id, page) {
-  const t = Date.now();
-  lsSet(LS.pos(id), JSON.stringify({ page, t })); // síncrono: garante mesmo se o iOS matar o app
-  try { await db.updateBook(id, { page, pageSavedAt: t }); } catch (e) { console.warn(e); }
+let safeTop = 0, safeBottom = 0;
+function measureSafeArea() {
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:fixed;visibility:hidden;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)";
+  document.body.appendChild(probe);
+  const cs = getComputedStyle(probe);
+  safeTop = parseFloat(cs.paddingTop) || 0;
+  safeBottom = parseFloat(cs.paddingBottom) || 0;
+  probe.remove();
+}
+const topPad = () => safeTop + 8;
+const bottomPad = () => safeBottom + 96;
+
+/** Posiciona todas as páginas para o zoom atual. */
+function layout() {
+  const sw = stage.clientWidth;
+  const baseW = Math.min(sw - 2 * PAD, 900);
+  const pageW = baseW * R.zoom;
+  const left = Math.max(PAD * R.zoom, (sw - pageW) / 2);
+  const gap = GAP * R.zoom;
+  let y = topPad();
+  for (let i = 0; i < R.els.length; i++) {
+    const h = pageW * R.aspects[i];
+    R.tops[i] = y;
+    R.heights[i] = h;
+    const s = R.els[i].style;
+    s.left = `${left}px`;
+    s.top = `${y}px`;
+    s.width = `${pageW}px`;
+    s.height = `${h}px`;
+    y += h + gap;
+  }
+  pagesEl.style.width = `${pageW + 2 * left}px`;
+  pagesEl.style.height = `${y - gap + bottomPad()}px`;
+  R.pageW = pageW;
+}
+
+/** Última página cujo topo está acima de y (busca binária). */
+function pageIndexAt(y) {
+  let lo = 0, hi = R.tops.length - 1, ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (R.tops[mid] <= y) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return ans;
+}
+
+/** Ponto exato de leitura: página + fração da página no topo da tela. */
+function getAnchor() {
+  const y = stage.scrollTop + topPad();
+  const i = pageIndexAt(y);
+  const span = R.heights[i] + GAP * R.zoom;
+  const sw = stage.scrollWidth;
+  return {
+    page: i + 1,
+    frac: clamp((y - R.tops[i]) / span, 0, 1),
+    x: sw > stage.clientWidth ? stage.scrollLeft / sw : 0,
+  };
+}
+function applyAnchor(a) {
+  const i = clamp((a.page || 1) - 1, 0, R.els.length - 1);
+  const span = R.heights[i] + GAP * R.zoom;
+  stage.scrollTop = R.tops[i] + (a.frac || 0) * span - topPad();
+  stage.scrollLeft = (a.x || 0) * stage.scrollWidth;
+}
+function currentPage() {
+  return pageIndexAt(stage.scrollTop + stage.clientHeight * 0.35) + 1;
 }
 
 async function openBook(id) {
@@ -332,9 +421,10 @@ async function openBook(id) {
   const file = await db.getFile(id);
   if (!file) { toast("Arquivo do livro não encontrado."); return; }
 
+  const pos = resolvePos(book);
   R.book = book;
-  R.page = resolvePage(book);
-  R.zoom = book.zoom || 1;
+  R.page = pos.page;
+  R.zoom = clamp(book.zoom || 1, MIN_ZOOM, MAX_ZOOM);
   lsSet(LS.open, id);
 
   $("#library").hidden = true;
@@ -342,25 +432,50 @@ async function openBook(id) {
   $("#reader").classList.remove("chrome-hidden");
   $("#reader-title").textContent = book.title;
   $("#page-indicator").textContent = `${R.page} / ${book.pageCount || "?"}`;
-  $("#page-wrap").innerHTML = "";
+  pagesEl.replaceChildren();
   $("#loading").hidden = false;
   document.title = `${book.title} — Marca Pagina Web`;
   history.replaceState(null, "", "#ler");
+  measureSafeArea();
 
   try {
     const data = file.data instanceof Blob ? new Uint8Array(await file.data.arrayBuffer()) : new Uint8Array(file.data);
     if (R.book !== book) return; // usuário saiu enquanto carregava
-    R.doc = await pdfjsLib.getDocument({ data }).promise;
-    if (R.book !== book) { R.doc.destroy(); return; }
-    if (book.pageCount !== R.doc.numPages) await db.updateBook(id, { pageCount: R.doc.numPages });
-    book.pageCount = R.doc.numPages;
-    R.page = Math.min(R.page, book.pageCount);
-    $("#slider").max = book.pageCount;
-    await renderPage();
+    const doc = await pdfjsLib.getDocument({ data }).promise;
+    if (R.book !== book) { doc.destroy(); return; }
+    R.doc = doc;
+    const n = doc.numPages;
+    if (book.pageCount !== n) await db.updateBook(id, { pageCount: n });
+    book.pageCount = n;
+
+    // Tamanho inicial de todas as páginas = tamanho da página 1 (corrigido ao desenhar cada uma).
+    const first = await doc.getPage(1);
+    const v1 = first.getViewport({ scale: 1 });
+    R.aspects = new Array(n).fill(v1.height / v1.width);
+    R.tops = new Array(n);
+    R.heights = new Array(n);
+    R.els = [];
+    const frag = document.createDocumentFragment();
+    for (let i = 1; i <= n; i++) {
+      const el = document.createElement("div");
+      el.className = "pg";
+      el.dataset.n = i;
+      R.els.push(el);
+      frag.appendChild(el);
+    }
+    pagesEl.appendChild(frag);
+    layout();
+    applyAnchor(pos.anchor || { page: pos.page, frac: 0, x: 0 });
+    R.page = currentPage();
+    $("#slider").max = n;
+    updatePageUI();
+    setupObserver();
+    stage.focus({ preventScroll: true });
+    $("#loading").hidden = true;
+
     await db.updateBook(id, { lastOpened: Date.now() });
     if (R.page > 1) toast(`Continuando na página ${R.page}`, 1800);
-    // esconde as barras depois de um tempo para leitura limpa
-    setTimeout(() => { if (R.book === book) $("#reader").classList.add("chrome-hidden"); }, 2200);
+    setTimeout(() => { if (R.book === book) hideChrome(); }, 2200);
   } catch (err) {
     console.error(err);
     toast("Não foi possível abrir este PDF.", 3500);
@@ -368,13 +483,111 @@ async function openBook(id) {
   }
 }
 
+function setupObserver() {
+  if (R.observer) R.observer.disconnect();
+  R.near.clear();
+  const margin = Math.round(stage.clientHeight * 1.2);
+  R.observer = new IntersectionObserver(
+    (entries) => {
+      for (const en of entries) {
+        const n = Number(en.target.dataset.n);
+        if (en.isIntersecting) R.near.add(n);
+        else { R.near.delete(n); releasePage(n); }
+      }
+      pump();
+    },
+    { root: stage, rootMargin: `${margin}px 0px ${margin}px 0px` }
+  );
+  for (const el of R.els) R.observer.observe(el);
+}
+
+function releasePage(n) {
+  const el = R.els[n - 1];
+  if (!el) return;
+  for (const c of el.querySelectorAll("canvas")) { c.width = c.height = 0; c.remove(); }
+}
+
+/** Desenha, uma por vez, as páginas próximas que ainda não estão na resolução certa. */
+async function pump() {
+  const doc = R.doc;
+  // a fila é por documento: se um livro anterior travou no meio, não bloqueia o novo
+  if (!doc || R.pumping === doc) return;
+  R.pumping = doc;
+  try {
+    while (R.doc === doc) {
+      const n = nextToRender();
+      if (!n) break;
+      await renderOne(doc, n);
+    }
+  } finally {
+    if (R.pumping === doc) R.pumping = null;
+  }
+}
+function nextToRender() {
+  let best = 0, bestD = Infinity;
+  for (const n of R.near) {
+    const el = R.els[n - 1];
+    if (!el || el.dataset.failed) continue;
+    const c = el.querySelector("canvas");
+    if (c && Math.abs(Number(c.dataset.w) - R.pageW) < 1) continue;
+    const d = Math.abs(n - R.page);
+    if (d < bestD) { bestD = d; best = n; }
+  }
+  return best;
+}
+async function renderOne(doc, n) {
+  try {
+    const page = await doc.getPage(n);
+    if (R.doc !== doc) return;
+    const v1 = page.getViewport({ scale: 1 });
+    const aspect = v1.height / v1.width;
+    if (Math.abs(aspect - R.aspects[n - 1]) > 0.002 && !R.pinch) {
+      // página com tamanho diferente: reposiciona sem mover o ponto de leitura
+      const a = getAnchor();
+      R.aspects[n - 1] = aspect;
+      layout();
+      applyAnchor(a);
+    }
+    const cssW = R.pageW;
+    const scale = cssW / v1.width;
+    const cssH = v1.height * scale;
+    let dpr = Math.min(window.devicePixelRatio || 1, 3);
+    if (cssW * cssH * dpr * dpr > MAX_PIXELS) dpr = Math.sqrt(MAX_PIXELS / (cssW * cssH));
+    const vp = page.getViewport({ scale: scale * dpr });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(vp.width);
+    canvas.height = Math.floor(vp.height);
+    canvas.dataset.w = cssW;
+    const ctx = canvas.getContext("2d", { alpha: false });
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    page.cleanup();
+
+    const el = R.els[n - 1];
+    if (R.doc !== doc || !R.near.has(n) || !el) { canvas.width = canvas.height = 0; return; }
+    const old = el.querySelectorAll("canvas");
+    el.appendChild(canvas);
+    for (const c of old) { c.width = c.height = 0; c.remove(); }
+  } catch (err) {
+    if (R.doc !== doc) return;
+    console.error(err);
+    const el = R.els[n - 1];
+    if (el) el.dataset.failed = "1";
+  }
+}
+
 async function closeBook() {
-  if (R.book) await savePosition(R.book.id, R.page);
-  if (R.renderTask) { try { R.renderTask.cancel(); } catch {} }
-  if (R.doc) { try { await R.doc.destroy(); } catch {} }
-  R.book = null; R.doc = null; R.renderTask = null;
-  for (const c of document.querySelectorAll("#page-wrap canvas")) { c.width = c.height = 0; }
-  $("#page-wrap").innerHTML = "";
+  if (R.book && R.doc) await savePosition(R.book.id, R.page, getAnchor());
+  clearTimeout(saveTimer);
+  if (R.observer) R.observer.disconnect();
+  R.observer = null;
+  for (let i = 1; i <= R.els.length; i++) releasePage(i);
+  const doc = R.doc;
+  R.book = null; R.doc = null; R.els = []; R.near.clear();
+  pagesEl.replaceChildren();
+  if (doc) { try { await doc.destroy(); } catch {} }
   lsDel(LS.open);
   showLibrary();
 }
@@ -387,116 +600,152 @@ function showLibrary() {
   renderLibrary();
 }
 
-async function renderPage() {
-  if (!R.doc) return;
-  const seq = ++R.renderSeq;
-  const pageNum = R.page;
-  updatePageUI();
-
-  if (R.renderTask) { try { R.renderTask.cancel(); } catch {} }
-  const slow = setTimeout(() => { if (seq === R.renderSeq) $("#loading").hidden = false; }, 150);
-
-  try {
-    const page = await R.doc.getPage(pageNum);
-    if (seq !== R.renderSeq) return;
-    const stage = $("#stage");
-    const base = page.getViewport({ scale: 1 });
-    const availW = stage.clientWidth;
-    const availH = stage.clientHeight;
-    // Ajusta à largura; em telas largas (paisagem/iPad) limita pela altura para caber a página.
-    let fit = availW / base.width;
-    if (availW > availH && base.height * fit > availH * 1.6) fit = (availH * 1.6) / base.height;
-    if (availW >= 700) fit = Math.min(fit, (availH - 16) / base.height);
-    const cssScale = fit * R.zoom;
-    const cssVp = page.getViewport({ scale: cssScale });
-
-    // resolução: devicePixelRatio, limitada para não estourar a memória do iPhone
-    let dpr = Math.min(window.devicePixelRatio || 1, 3);
-    const MAX_PIXELS = 9_000_000;
-    if (cssVp.width * cssVp.height * dpr * dpr > MAX_PIXELS) dpr = Math.sqrt(MAX_PIXELS / (cssVp.width * cssVp.height));
-    const vp = page.getViewport({ scale: cssScale * dpr });
-
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.floor(vp.width);
-    canvas.height = Math.floor(vp.height);
-    canvas.style.width = `${Math.floor(cssVp.width)}px`;
-    canvas.style.height = `${Math.floor(cssVp.height)}px`;
-    const ctx = canvas.getContext("2d", { alpha: false });
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    R.renderTask = page.render({ canvasContext: ctx, viewport: vp });
-    await R.renderTask.promise;
-    R.renderTask = null;
-    if (seq !== R.renderSeq) { canvas.width = canvas.height = 0; return; }
-
-    const wrap = $("#page-wrap");
-    for (const old of wrap.querySelectorAll("canvas")) { old.width = old.height = 0; }
-    wrap.replaceChildren(canvas);
-    stage.classList.toggle("zoomed", R.zoom > 1);
-    stage.scrollTo(0, 0);
-    page.cleanup();
-    prefetch(pageNum + 1);
-  } catch (err) {
-    if (err && err.name === "RenderingCancelledException") return;
-    console.error(err);
-    toast("Erro ao desenhar a página.");
-  } finally {
-    clearTimeout(slow);
-    if (seq === R.renderSeq) $("#loading").hidden = true;
-  }
-}
-
-function prefetch(n) {
-  // pede ao pdf.js para já interpretar a próxima página (deixa a virada mais rápida)
-  if (R.doc && n <= R.doc.numPages) R.doc.getPage(n).catch(() => {});
-}
-
 function updatePageUI() {
   const total = R.book ? R.book.pageCount : 1;
   $("#page-indicator").textContent = `${R.page} / ${total}`;
   $("#slider").value = R.page;
-  $("#btn-prev").disabled = R.page <= 1;
-  $("#btn-next").disabled = R.page >= total;
-  $("#btn-zoom-out").disabled = R.zoom <= ZOOMS[0];
-  $("#btn-zoom-in").disabled = R.zoom >= ZOOMS[ZOOMS.length - 1];
 }
 
-let savedFlashTimer;
 function goTo(n) {
-  if (!R.book || !R.doc) return;
-  const total = R.book.pageCount;
-  n = Math.min(Math.max(1, Math.round(n)), total);
-  if (n === R.page) return;
+  if (!R.doc) return;
+  n = clamp(Math.round(n), 1, R.els.length);
+  stage.scrollTop = R.tops[n - 1] - topPad();
   R.page = n;
-  savePosition(R.book.id, n);
-  const el = $("#saved-toast");
-  el.classList.add("show");
-  clearTimeout(savedFlashTimer);
-  savedFlashTimer = setTimeout(() => el.classList.remove("show"), 700);
-  renderPage();
+  updatePageUI();
+  saveNow();
 }
-const next = () => goTo(R.page + 1);
-const prev = () => goTo(R.page - 1);
 
-function setZoom(z) {
-  if (!R.book) return;
-  R.zoom = z;
-  db.updateBook(R.book.id, { zoom: z });
-  renderPage();
+// ---- salvar posição durante a leitura
+let saveTimer;
+function saveNow() {
+  clearTimeout(saveTimer);
+  if (R.book && R.doc) savePosition(R.book.id, R.page, getAnchor());
 }
-function zoomStep(dir) {
-  const i = ZOOMS.indexOf(R.zoom);
-  const ni = Math.min(Math.max(0, (i < 0 ? 0 : i) + dir), ZOOMS.length - 1);
-  setZoom(ZOOMS[ni]);
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, 400);
 }
+
+// ---- rolagem
+let scrollRaf = 0, chromeRefTop = 0;
+stage.addEventListener("scroll", () => {
+  if (!scrollRaf) scrollRaf = requestAnimationFrame(onScroll);
+}, { passive: true });
+function onScroll() {
+  scrollRaf = 0;
+  if (!R.doc || R.pinch) return;
+  const p = currentPage();
+  if (p !== R.page) { R.page = p; updatePageUI(); }
+  scheduleSave();
+  if (!$("#reader").classList.contains("chrome-hidden") && Math.abs(stage.scrollTop - chromeRefTop) > 60) hideChrome();
+}
+
+function hideChrome() { $("#reader").classList.add("chrome-hidden"); }
+function toggleChrome() {
+  const r = $("#reader");
+  const hidden = r.classList.toggle("chrome-hidden");
+  if (!hidden) chromeRefTop = stage.scrollTop;
+}
+
+// ---- zoom
+/** Aplica um novo zoom mantendo o ponto (cx, cy) do conteúdo sob a posição (fx, fy) da tela. */
+function commitZoom(newZoom, cx, cy, fx, fy) {
+  newZoom = clamp(newZoom, MIN_ZOOM, MAX_ZOOM);
+  const s = newZoom / R.zoom;
+  R.zoom = newZoom;
+  layout();
+  const T = topPad();
+  stage.scrollLeft = cx * s - fx;
+  stage.scrollTop = T + (cy - T) * s - fy;
+  if (R.book) db.updateBook(R.book.id, { zoom: newZoom });
+  R.page = currentPage();
+  updatePageUI();
+  scheduleSave();
+  pump();
+}
+
+function stagePoint(clientX, clientY) {
+  const r = stage.getBoundingClientRect();
+  return { fx: clientX - r.left, fy: clientY - r.top };
+}
+
+// Pinça com dois dedos: durante o gesto só escala visualmente (rápido);
+// ao soltar, refaz o layout no novo tamanho e redesenha nítido.
+stage.addEventListener("touchstart", (e) => {
+  if (e.touches.length === 2 && R.doc) {
+    e.preventDefault();
+    const [a, b] = e.touches;
+    const { fx, fy } = stagePoint((a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2);
+    R.pinch = {
+      d0: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) || 1,
+      cx: stage.scrollLeft + fx,
+      cy: stage.scrollTop + fy,
+      z0: R.zoom,
+      s: 1, fx, fy,
+    };
+    pagesEl.style.transformOrigin = "0 0";
+    pagesEl.style.willChange = "transform";
+  }
+}, { passive: false });
+
+stage.addEventListener("touchmove", (e) => {
+  const p = R.pinch;
+  if (!p || e.touches.length < 2) return;
+  if (e.cancelable) e.preventDefault();
+  const [a, b] = e.touches;
+  const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+  const { fx, fy } = stagePoint((a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2);
+  p.s = clamp(d / p.d0, MIN_ZOOM / p.z0, MAX_ZOOM / p.z0);
+  p.fx = fx; p.fy = fy;
+  const tx = fx + stage.scrollLeft - p.cx * p.s;
+  const ty = fy + stage.scrollTop - p.cy * p.s;
+  pagesEl.style.transform = `translate(${tx}px, ${ty}px) scale(${p.s})`;
+}, { passive: false });
+
+function endPinch() {
+  const p = R.pinch;
+  if (!p) return;
+  R.pinch = null;
+  R.lastPinchEnd = Date.now();
+  pagesEl.style.transform = "";
+  pagesEl.style.willChange = "";
+  commitZoom(p.z0 * p.s, p.cx, p.cy, p.fx, p.fy);
+}
+stage.addEventListener("touchend", (e) => { if (R.pinch && e.touches.length < 2) endPinch(); });
+stage.addEventListener("touchcancel", () => endPinch());
+// impede o zoom nativo do Safari (que ampliaria a tela inteira, barras incluídas)
+for (const ev of ["gesturestart", "gesturechange", "gestureend"]) {
+  document.addEventListener(ev, (e) => e.preventDefault(), { passive: false });
+}
+
+// Toque simples: mostra/esconde as barras. Toque duplo: amplia/reduz naquele ponto.
+let lastTap = null, tapTimer = 0;
+stage.addEventListener("click", (e) => {
+  if (!R.doc || Date.now() - R.lastPinchEnd < 400) return;
+  const now = Date.now();
+  if (lastTap && now - lastTap.t < 300 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 40) {
+    clearTimeout(tapTimer);
+    lastTap = null;
+    const { fx, fy } = stagePoint(e.clientX, e.clientY);
+    const target = R.zoom > 1.05 ? 1 : 2;
+    commitZoom(target, stage.scrollLeft + fx, stage.scrollTop + fy, fx, fy);
+    return;
+  }
+  lastTap = { t: now, x: e.clientX, y: e.clientY };
+  clearTimeout(tapTimer);
+  tapTimer = setTimeout(toggleChrome, 300);
+});
+
+// Computador: Ctrl + roda do mouse (ou pinça no trackpad) faz zoom
+stage.addEventListener("wheel", (e) => {
+  if (!e.ctrlKey || !R.doc) return;
+  e.preventDefault();
+  const { fx, fy } = stagePoint(e.clientX, e.clientY);
+  commitZoom(R.zoom * Math.exp(-e.deltaY * 0.01), stage.scrollLeft + fx, stage.scrollTop + fy, fx, fy);
+}, { passive: false });
 
 // ---- controles
 $("#btn-back").addEventListener("click", closeBook);
-$("#btn-next").addEventListener("click", next);
-$("#btn-prev").addEventListener("click", prev);
-$("#btn-zoom-in").addEventListener("click", () => zoomStep(1));
-$("#btn-zoom-out").addEventListener("click", () => zoomStep(-1));
 $("#slider").addEventListener("input", (e) => {
   $("#page-indicator").textContent = `${e.target.value} / ${R.book ? R.book.pageCount : 1}`;
 });
@@ -514,60 +763,30 @@ $("#btn-night").addEventListener("click", () => {
 });
 if (lsGet(LS.night) === "1") $("#reader").classList.add("night");
 
-// ---- gestos: toque nas bordas vira a página, toque no meio mostra/esconde barras, deslizar vira a página
-(() => {
-  const stage = $("#stage");
-  let start = null;
-  stage.addEventListener("pointerdown", (e) => {
-    if (!e.isPrimary) { start = null; return; }
-    start = { x: e.clientX, y: e.clientY, t: Date.now() };
-  });
-  stage.addEventListener("pointercancel", () => { start = null; });
-  stage.addEventListener("pointerup", (e) => {
-    if (!start || !e.isPrimary) return;
-    const dx = e.clientX - start.x;
-    const dy = e.clientY - start.y;
-    const dt = Date.now() - start.t;
-    start = null;
-    const reader = $("#reader");
-
-    if (R.zoom === 1 && Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.4 && dt < 800) {
-      dx < 0 ? next() : prev();
-      return;
-    }
-    if (Math.abs(dx) < 10 && Math.abs(dy) < 10 && dt < 450) {
-      const w = stage.clientWidth;
-      const x = e.clientX;
-      if (x < w * 0.28) prev();
-      else if (x > w * 0.72) next();
-      else reader.classList.toggle("chrome-hidden");
-    }
-  });
-})();
-
-// teclado (iPad com teclado / computador)
 document.addEventListener("keydown", (e) => {
   if ($("#reader").hidden || $("#book-menu").open) return;
-  if (["ArrowRight", "PageDown", " "].includes(e.key)) { e.preventDefault(); next(); }
-  else if (["ArrowLeft", "PageUp"].includes(e.key)) { e.preventDefault(); prev(); }
-  else if (e.key === "Escape") closeBook();
+  if (e.key === "Escape") closeBook();
 });
 
-// girar a tela / redimensionar → redesenhar
+// girar a tela / redimensionar → refaz o layout mantendo o ponto de leitura
 let resizeTimer, lastSize = `${innerWidth}x${innerHeight}`;
 window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
     const size = `${innerWidth}x${innerHeight}`;
-    if (size !== lastSize && R.doc) { lastSize = size; renderPage(); }
+    if (size === lastSize || !R.doc) { lastSize = size; return; }
     lastSize = size;
+    const a = getAnchor();
+    measureSafeArea();
+    layout();
+    applyAnchor(a);
+    setupObserver();
   }, 200);
 });
 
 // salvar ao sair do app (fechar, trocar de app, bloquear o iPhone)
-function flush() { if (R.book) savePosition(R.book.id, R.page); }
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flush(); });
-window.addEventListener("pagehide", flush);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveNow(); });
+window.addEventListener("pagehide", saveNow);
 
 /* ===================================================================
    Inicialização

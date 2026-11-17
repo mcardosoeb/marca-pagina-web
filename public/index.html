@@ -75,29 +75,17 @@
       </div>
     </header>
 
-    <div id="stage" class="stage">
-      <div id="page-wrap" class="page-wrap"></div>
-      <div id="loading" class="loading" hidden><div class="spinner"></div></div>
+    <div id="stage" class="stage" tabindex="-1">
+      <div id="pages" class="pages"></div>
     </div>
+    <div id="loading" class="loading" hidden><div class="spinner"></div></div>
 
     <footer class="reader-bar bottom">
       <div class="nav-row">
-        <button id="btn-prev" class="bar-btn icon" aria-label="Página anterior">
-          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M15 5l-7 7 7 7" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
         <input id="slider" type="range" min="1" max="1" value="1" aria-label="Ir para a página" />
-        <button id="btn-next" class="bar-btn icon" aria-label="Próxima página">
-          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M9 5l7 7-7 7" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-      </div>
-      <div class="info-row">
-        <button id="btn-zoom-out" class="bar-btn icon small" aria-label="Diminuir zoom">−</button>
         <button id="page-indicator" class="page-indicator" aria-label="Digitar número da página">1 / 1</button>
-        <button id="btn-zoom-in" class="bar-btn icon small" aria-label="Aumentar zoom">+</button>
       </div>
     </footer>
-
-    <div id="saved-toast" class="saved-toast" aria-hidden="true">Página salva</div>
   </section>
 
   <!-- Menu de ações do livro -->

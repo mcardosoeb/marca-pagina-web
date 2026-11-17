@@ -1,6 +1,6 @@
 // Service worker do Marca Pagina Web: guarda o app no aparelho para funcionar offline.
 // Ao mudar qualquer arquivo do app, aumente a VERSION para os iPhones baixarem a atualização.
-const VERSION = "mpw-v1";
+const VERSION = "mpw-v2";
 const ASSETS = [
   "./",
   "./index.html",

@@ -5,7 +5,7 @@ Leitor de livros em PDF para iPhone (PWA) que **sempre lembra a página onde voc
 ## Como funciona
 
 - Os PDFs são guardados **no próprio iPhone** (IndexedDB). Nada é enviado ao servidor — o Railway só entrega o app.
-- A página atual é salva a cada virada de página e também quando o app vai para segundo plano/fecha.
+- A posição exata (página, ponto dentro dela e zoom) é salva enquanto você rola e também quando o app vai para segundo plano/fecha.
 - Se você fechar o app no meio de um livro, ele reabre **direto naquele livro e página**.
 - Na estante, cada livro mostra capa, progresso e a página onde parou.
 
@@ -13,11 +13,11 @@ Leitor de livros em PDF para iPhone (PWA) que **sempre lembra a página onde voc
 
 | Ação | Gesto |
 |---|---|
-| Próxima página | toque na borda direita ou deslize para a esquerda |
-| Página anterior | toque na borda esquerda ou deslize para a direita |
-| Mostrar/esconder barras | toque no meio da página |
+| Mudar de página | role para baixo / para cima (as páginas ficam em sequência) |
+| Zoom | pinça com dois dedos (até 4×); com zoom, arraste para mover |
+| Zoom rápido | toque duplo amplia 2× naquele ponto; outro toque duplo volta |
+| Mostrar/esconder barras | um toque na página |
 | Ir para uma página | arraste a barra ou toque em "13 / 240" e digite |
-| Zoom | botões − e + (com zoom, arraste para mover) |
 | Modo noturno | ícone de lua |
 | Renomear / remover / zerar marcador | botão ••• na capa do livro |
 
