@@ -1,0 +1,17 @@
+{
+  "name": "marca-pagina-web",
+  "version": "1.0.0",
+  "description": "Marca Pagina Web - leitor de PDF (PWA) que lembra onde você parou em cada livro.",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "icons": "node scripts/make-icons.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
